@@ -1,0 +1,10 @@
+/preprocess/
+/data/
+/body_models/
+/checkpoints/
+/tracking_intermediate_file/
+.codex
+/logs/
+*__pycache__*
+.DS_Store
+*.pyc
