@@ -11,7 +11,7 @@
 
 <p align="center">
 <a href="https://dingbang777.github.io/RePHO/"><img src="https://img.shields.io/badge/Page-GitHub%20Pages-2ea44f?logo=githubpages&logoColor=white"></a>
-<a href="https://arxiv.org/abs/2606."><img src="https://img.shields.io/badge/ArXiv-2605-%23B31C1C?logo=arxiv&logoSize=auto"></a>
+<a href="https://arxiv.org/abs/2606.05359"><img src="https://img.shields.io/badge/ArXiv-2606.05359-%23B31C1C?logo=arxiv&logoSize=auto"></a>
 <a href="https://dingbang777.github.io/RePHO/assets/SupMat.pdf"><img src="https://img.shields.io/badge/SupMat-PDF-d99a24?logo=adobeacrobatreader&logoColor=white"></a>
 <a href="https://www.youtube.com/watch?v=suYGJYmFbyg"><img src="https://img.shields.io/badge/YouTube-Video-EA3323?style=flat&logo=youtube&logoColor=EA3323"></a>
 <a href="#citation"><img src="https://img.shields.io/badge/BibTeX-Citation-4285f4?logo=googlescholar&logoColor=white"></a>
