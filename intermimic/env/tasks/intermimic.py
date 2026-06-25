@@ -16,6 +16,7 @@ import cv2
 import imageio
 import time
 import json
+import xml.etree.ElementTree as ET
 
 
 
@@ -51,6 +52,13 @@ class InterMimic(Humanoid_SMPLX):
         self.hoi_data_path = cfg['env'].get("hoi_data_path", None)
         self.file_name = self.motion_file.split('/')[-1]
         self.play_dataset = cfg['env']['playdataset']
+        if self.play_dataset:
+            cfg["env"]["disableSelfCollision"] = True
+            self._extra_agg_bodies = 52
+            self._extra_agg_shapes = 52
+        else:
+            self._extra_agg_bodies = 0
+            self._extra_agg_shapes = 0
         self.reward_weights = cfg["env"]["rewardWeights"]
         self.save_images = cfg['env']['saveImages']
         self.init_vel = cfg['env']['initVel']
@@ -492,15 +500,277 @@ class InterMimic(Humanoid_SMPLX):
     def _create_envs(self, num_envs, spacing, num_per_row):
 
         self._target_handles = []
+        self._body_proxy_handles = []
         self._load_target_asset()
+        if self.play_dataset:
+            self._load_play_dataset_body_proxy_assets()
         super()._create_envs(num_envs, spacing, num_per_row)
         return
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
         super()._build_env(env_id, env_ptr, humanoid_asset)
+        if self.play_dataset:
+            self.gym.set_actor_scale(env_ptr, self.humanoid_handles[env_id], 1e-4)
 
         self._build_target(env_id, env_ptr)
+        if self.play_dataset:
+            self._build_play_dataset_body_proxies(env_id, env_ptr)
         return   
+
+    def _load_play_dataset_body_proxy_assets(self):
+        self._body_proxy_asset = []
+        self._body_proxy_names = []
+        local_pos = []
+        local_rot = []
+
+        source_xml = os.path.join(self.root_file_path, self.sub_file_name, 'intermimic_humanoid.xml')
+        tree = ET.parse(source_xml)
+        root = tree.getroot()
+        body_nodes = []
+
+        def visit_body(node):
+            body_nodes.append(node)
+            for child in node.findall('body'):
+                visit_body(child)
+
+        worldbody = root.find('worldbody')
+        for body in worldbody.findall('body'):
+            visit_body(body)
+
+        if len(body_nodes) != self._extra_agg_bodies:
+            raise RuntimeError(
+                'Expected {} humanoid body proxies, found {} in {}'.format(
+                    self._extra_agg_bodies, len(body_nodes), source_xml)
+            )
+
+        proxy_asset_root = os.path.join(
+            self.root_file_path, self.sub_file_name, 'play_dataset_body_proxy_assets')
+        os.makedirs(proxy_asset_root, exist_ok=True)
+
+        asset_options = gymapi.AssetOptions()
+        asset_options.disable_gravity = True
+        asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
+        asset_options.vhacd_enabled = False
+
+        for body_idx, body in enumerate(body_nodes):
+            geom = body.find('geom')
+            if geom is None:
+                raise RuntimeError('Body {} has no geom in {}'.format(body.attrib.get('name', body_idx), source_xml))
+
+            body_name = body.attrib.get('name', 'body_{}'.format(body_idx))
+            geom_type = geom.attrib.get('type', 'sphere')
+            self._body_proxy_names.append(body_name)
+
+            if geom_type == 'sphere':
+                offset = self._parse_vec3_attr(geom.attrib.get('pos', '0 0 0'))
+                rot = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            elif geom_type == 'box':
+                offset = self._parse_vec3_attr(geom.attrib.get('pos', '0 0 0'))
+                rot = self._parse_mjcf_quat_attr(geom.attrib.get('quat', '1 0 0 0'))
+            elif geom_type == 'capsule':
+                fromto = np.array([float(v) for v in geom.attrib['fromto'].split()], dtype=np.float32)
+                start = fromto[:3]
+                end = fromto[3:]
+                axis = end - start
+                length = float(np.linalg.norm(axis))
+                if length <= 1e-8:
+                    raise RuntimeError('Capsule body {} has degenerate fromto in {}'.format(body_name, source_xml))
+                offset = 0.5 * (start + end)
+                rot = self._quat_from_axis_to_vec(np.array([0.0, 0.0, 1.0], dtype=np.float32), axis / length)
+            else:
+                raise RuntimeError('Unsupported play_dataset proxy geom type {} on body {}'.format(geom_type, body_name))
+
+            proxy_asset_file = self._write_play_dataset_body_proxy_asset(
+                proxy_asset_root, body_idx, body_name, geom)
+            asset = self.gym.load_asset(
+                self.sim, proxy_asset_root, os.path.basename(proxy_asset_file), asset_options)
+            body_count = self.gym.get_asset_rigid_body_count(asset)
+            shape_count = self.gym.get_asset_rigid_shape_count(asset)
+            if body_count != 1 or shape_count != 1:
+                raise RuntimeError(
+                    'Expected one body and one shape in proxy asset {}, got {} bodies and {} shapes'.format(
+                        proxy_asset_file, body_count, shape_count)
+                )
+            self._body_proxy_asset.append(asset)
+            local_pos.append(offset)
+            local_rot.append(rot)
+
+        self._body_proxy_local_pos = to_torch(np.stack(local_pos, axis=0), device=self.device, dtype=torch.float)
+        self._body_proxy_local_rot = to_torch(np.stack(local_rot, axis=0), device=self.device, dtype=torch.float)
+        return
+
+    def _write_play_dataset_body_proxy_asset(self, asset_root, body_idx, body_name, geom):
+        safe_name = self._safe_asset_name(body_name)
+        mesh_name = 'proxy_{:02d}_{}.obj'.format(body_idx, safe_name)
+        urdf_name = 'proxy_{:02d}_{}.urdf'.format(body_idx, safe_name)
+        mesh_path = os.path.join(asset_root, mesh_name)
+        urdf_path = os.path.join(asset_root, urdf_name)
+
+        mesh = self._create_play_dataset_body_proxy_mesh(geom)
+        mesh.export(mesh_path)
+
+        robot = ET.Element('robot', {'name': 'proxy_{:02d}_{}'.format(body_idx, safe_name)})
+        link = ET.SubElement(robot, 'link', {'name': 'proxy_body'})
+        visual = ET.SubElement(link, 'visual')
+        ET.SubElement(visual, 'origin', {'xyz': '0 0 0', 'rpy': '0 0 0'})
+        visual_geometry = ET.SubElement(visual, 'geometry')
+        ET.SubElement(visual_geometry, 'mesh', {'filename': mesh_name})
+        material = ET.SubElement(visual, 'material', {'name': 'proxy_body_mat'})
+        ET.SubElement(material, 'color', {'rgba': '0.75 0.54 0.30 1'})
+
+        collision = ET.SubElement(link, 'collision')
+        ET.SubElement(collision, 'origin', {'xyz': '0 0 0', 'rpy': '0 0 0'})
+        collision_geometry = ET.SubElement(collision, 'geometry')
+        ET.SubElement(collision_geometry, 'sphere', {'radius': '0.001'})
+
+        inertial = ET.SubElement(link, 'inertial')
+        ET.SubElement(inertial, 'origin', {'xyz': '0 0 0', 'rpy': '0 0 0'})
+        ET.SubElement(inertial, 'mass', {'value': '0.001'})
+        ET.SubElement(inertial, 'inertia', {
+            'ixx': '1e-6', 'ixy': '0', 'ixz': '0',
+            'iyy': '1e-6', 'iyz': '0', 'izz': '1e-6',
+        })
+
+        tree = ET.ElementTree(robot)
+        tree.write(urdf_path, encoding='utf-8', xml_declaration=True)
+        return urdf_path
+
+    def _create_play_dataset_body_proxy_mesh(self, geom):
+        geom_type = geom.attrib.get('type', 'sphere')
+        if geom_type == 'sphere':
+            radius = float(geom.attrib['size'].split()[0])
+            offset = self._parse_vec3_attr(geom.attrib.get('pos', '0 0 0')).astype(np.float64)
+            transform = self._make_transform_np(np.eye(3, dtype=np.float64), offset)
+            return trimesh.creation.uv_sphere(radius=radius, count=[16, 32], transform=transform)
+
+        if geom_type == 'box':
+            size = np.array([float(v) for v in geom.attrib['size'].split()], dtype=np.float64)
+            offset = self._parse_vec3_attr(geom.attrib.get('pos', '0 0 0')).astype(np.float64)
+            rot = self._parse_mjcf_quat_attr(geom.attrib.get('quat', '1 0 0 0')).astype(np.float64)
+            transform = self._make_transform_np(self._quat_xyzw_to_matrix_np(rot), offset)
+            return trimesh.creation.box(extents=2.0 * size, transform=transform)
+
+        if geom_type == 'capsule':
+            fromto = np.array([float(v) for v in geom.attrib['fromto'].split()], dtype=np.float64)
+            start = fromto[:3]
+            end = fromto[3:]
+            axis = end - start
+            length = float(np.linalg.norm(axis))
+            if length <= 1e-8:
+                raise RuntimeError('Proxy capsule has degenerate fromto {}'.format(geom.attrib['fromto']))
+            radius = float(geom.attrib['size'].split()[0])
+            offset = 0.5 * (start + end)
+            rot = self._rotation_matrix_from_vec_to_vec_np(
+                np.array([0.0, 0.0, 1.0], dtype=np.float64), axis / length)
+            transform = self._make_transform_np(rot, offset)
+            return trimesh.creation.capsule(height=length, radius=radius, count=[12, 24], transform=transform)
+
+        raise RuntimeError('Unsupported play_dataset proxy mesh geom type {}'.format(geom_type))
+
+    def _safe_asset_name(self, name):
+        return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in name)
+
+    def _build_play_dataset_body_proxies(self, env_id, env_ptr):
+        default_pose = gymapi.Transform()
+        default_pose.p = gymapi.Vec3(10000.0, 10000.0, 10000.0)
+        default_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+        col_group = env_id + 2 * self.num_envs
+        col_filter = 1
+        segmentation_id = 0
+
+        env_handles = []
+        for body_idx, asset in enumerate(self._body_proxy_asset):
+            body_name = self._body_proxy_names[body_idx]
+            handle = self.gym.create_actor(
+                env_ptr, asset, default_pose,
+                'play_dataset_body_{:02d}_{}'.format(body_idx, body_name),
+                col_group, col_filter, segmentation_id)
+            self.gym.set_rigid_body_color(
+                env_ptr, handle, 0, gymapi.MESH_VISUAL,
+                gymapi.Vec3(0.75, 0.54, 0.3))
+            env_handles.append(handle)
+
+        self._body_proxy_handles.append(env_handles)
+        return
+
+    def _parse_vec3_attr(self, text):
+        return np.array([float(v) for v in text.split()], dtype=np.float32)
+
+    def _parse_mjcf_quat_attr(self, text):
+        quat_wxyz = [float(v) for v in text.split()]
+        return np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float32)
+
+    def _quat_from_axis_to_vec(self, source, target):
+        source = source.astype(np.float32)
+        source = source / np.linalg.norm(source)
+        target = target.astype(np.float32)
+        target = target / np.linalg.norm(target)
+        dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
+
+        if dot > 1.0 - 1e-6:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        if dot < -1.0 + 1e-6:
+            fallback = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            if abs(float(np.dot(source, fallback))) > 0.9:
+                fallback = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            axis = np.cross(source, fallback)
+            axis = axis / np.linalg.norm(axis)
+            return np.array([axis[0], axis[1], axis[2], 0.0], dtype=np.float32)
+
+        axis = np.cross(source, target)
+        axis = axis / np.linalg.norm(axis)
+        angle = np.arccos(dot)
+        sin_half = np.sin(0.5 * angle)
+        return np.array([
+            axis[0] * sin_half,
+            axis[1] * sin_half,
+            axis[2] * sin_half,
+            np.cos(0.5 * angle),
+        ], dtype=np.float32)
+
+    def _make_transform_np(self, rot, pos):
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = rot
+        transform[:3, 3] = pos
+        return transform
+
+    def _quat_xyzw_to_matrix_np(self, quat):
+        quat = np.asarray(quat, dtype=np.float64)
+        quat = quat / np.linalg.norm(quat)
+        x, y, z, w = quat
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return np.array([
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ], dtype=np.float64)
+
+    def _rotation_matrix_from_vec_to_vec_np(self, source, target):
+        source = np.asarray(source, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+        source = source / np.linalg.norm(source)
+        target = target / np.linalg.norm(target)
+        cross = np.cross(source, target)
+        dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
+
+        if dot > 1.0 - 1e-8:
+            return np.eye(3, dtype=np.float64)
+        if dot < -1.0 + 1e-8:
+            fallback = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(np.dot(source, fallback))) > 0.9:
+                fallback = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            axis = np.cross(source, fallback)
+            axis = axis / np.linalg.norm(axis)
+            return -np.eye(3, dtype=np.float64) + 2.0 * np.outer(axis, axis)
+
+        skew = np.array([
+            [0.0, -cross[2], cross[1]],
+            [cross[2], 0.0, -cross[0]],
+            [-cross[1], cross[0], 0.0],
+        ], dtype=np.float64)
+        return np.eye(3, dtype=np.float64) + skew + skew @ skew * (1.0 / (1.0 + dot))
 
     def _load_target_asset(self): # smplx
         
@@ -551,8 +821,8 @@ class InterMimic(Humanoid_SMPLX):
         return
 
     def _build_target(self, env_id, env_ptr):
-        col_group = env_id
-        col_filter = 0
+        col_group = env_id + self.num_envs if self.play_dataset else env_id
+        col_filter = 1 if self.play_dataset else 0
         segmentation_id = 1
 
         default_pose = gymapi.Transform()
@@ -579,9 +849,16 @@ class InterMimic(Humanoid_SMPLX):
 
     def _build_target_tensors(self):
         num_actors = self.get_num_actors_per_env()
-        self._target_states = self._root_states.view(self.num_envs, num_actors, self._root_states.shape[-1])[..., 1, :]
+        root_states_view = self._root_states.view(self.num_envs, num_actors, self._root_states.shape[-1])
+        self._target_states = root_states_view[..., 1, :]
         
         self._tar_actor_ids = to_torch(num_actors * np.arange(self.num_envs), device=self.device, dtype=torch.int32) + 1
+
+        if self.play_dataset:
+            proxy_actor_offsets = torch.arange(self.num_bodies, device=self.device, dtype=torch.int32) + 2
+            proxy_actor_bases = num_actors * torch.arange(self.num_envs, device=self.device, dtype=torch.int32).unsqueeze(1)
+            self._body_proxy_actor_ids = proxy_actor_bases + proxy_actor_offsets.unsqueeze(0)
+            self._body_proxy_states = root_states_view[:, 2:2 + self.num_bodies, :]
         
         bodies_per_env = self._rigid_body_state.shape[0] // self.num_envs
         contact_force_tensor = self.gym.acquire_net_contact_force_tensor(self.sim)
@@ -2098,36 +2375,41 @@ class InterMimic(Humanoid_SMPLX):
                 dtype=torch.long
             )
         ### update object ###
-        self._target_states[env_ids, :3] = self.extract_data_component('obj_pos', True, self.data_id[env_ids], t)
-        self._target_states[env_ids, 3:7] = self.extract_data_component('obj_rot', True, self.data_id[env_ids], t)
-        self._target_states[env_ids, 7:10] = torch.zeros_like(self._target_states[env_ids, 7:10])
-        self._target_states[env_ids, 10:13] = torch.zeros_like(self._target_states[env_ids, 10:13])
+        obj_pos = self.extract_data_component('obj_pos', True, self.data_id[env_ids], t)
+        obj_rot = self.extract_data_component('obj_rot', True, self.data_id[env_ids], t)
+        self._target_states[env_ids, :3] = obj_pos
+        self._target_states[env_ids, 3:7] = obj_rot
+        self._target_states[env_ids, 7:13] = 0.0
 
         ### update subject ###   
         _humanoid_root_pos = self.extract_data_component('root_pos', True, self.data_id[env_ids], t)
         _humanoid_root_rot = self.extract_data_component('root_rot', True, self.data_id[env_ids], t)
         self._humanoid_root_states[env_ids, 0:3] = _humanoid_root_pos
         self._humanoid_root_states[env_ids, 3:7] = _humanoid_root_rot
-        self._humanoid_root_states[:, 7:10] = torch.zeros_like(self._humanoid_root_states[:, 7:10])
-        self._humanoid_root_states[:, 10:13] = torch.zeros_like(self._humanoid_root_states[:, 10:13])
+        self._humanoid_root_states[env_ids, 7:13] = 0.0
         
         self._dof_pos[env_ids] = self.extract_data_component('dof_pos', True, self.data_id[env_ids], t)
-        self._dof_vel[env_ids] = self.extract_data_component('dof_vel', True, self.data_id[env_ids], t)
+        self._dof_vel[env_ids] = 0.0
 
+        body_pos = self.extract_data_component('body_pos', True, self.data_id[env_ids], t).view(len(env_ids), self.num_bodies, 3)
+        body_rot = self.extract_data_component('body_rot', True, self.data_id[env_ids], t).view(len(env_ids), self.num_bodies, 4)
+        self._body_proxy_states[env_ids, :, 0:3] = body_pos
+        self._body_proxy_states[env_ids, :, 3:7] = body_rot
+        self._body_proxy_states[env_ids, :, 7:13] = 0.0
 
-        env_ids_int32 = self._humanoid_actor_ids[env_ids]
+        actor_ids = torch.cat((
+            self._humanoid_actor_ids[env_ids],
+            self._tar_actor_ids[env_ids],
+            self._body_proxy_actor_ids[env_ids].reshape(-1),
+        ), dim=0)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(self._root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                                     gymtorch.unwrap_tensor(actor_ids), len(actor_ids))
+        humanoid_actor_ids = self._humanoid_actor_ids[env_ids]
         self.gym.set_dof_state_tensor_indexed(self.sim,
                                               gymtorch.unwrap_tensor(self._dof_state),
-                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
-        
-        env_ids_int32 = self._tar_actor_ids[env_ids]
-        self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self._root_states),
-                                                    gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                              gymtorch.unwrap_tensor(humanoid_actor_ids), len(humanoid_actor_ids))
 
-        self._refresh_sim_tensors()
         obj_contact = self.extract_data_component('contact_obj', True, self.data_id[env_ids], t)
         obj_contact = torch.any(obj_contact > 0.1, dim=-1)
         human_contact = self.extract_data_component('contact_human', True, self.data_id[env_ids], t)
@@ -2143,16 +2425,18 @@ class InterMimic(Humanoid_SMPLX):
                     self.gym.set_rigid_body_color(env_ptr, handle, 0, gymapi.MESH_VISUAL,
                                                 gymapi.Vec3(0., 0., 1.))
                     
+                body_proxy_handles = self._body_proxy_handles[env_id]
                 handle = self.humanoid_handles[env_id]
                 for j in range(self.num_bodies):
+                    color_handle = body_proxy_handles[j]
                     if human_contact[env_id, j] > 0.5:
-                        self.gym.set_rigid_body_color(env_ptr, handle, j, gymapi.MESH_VISUAL,
+                        self.gym.set_rigid_body_color(env_ptr, color_handle, 0, gymapi.MESH_VISUAL,
                                                     gymapi.Vec3(1., 0., 0.))
                     elif human_contact[env_id, j] > -0.5:
-                        self.gym.set_rigid_body_color(env_ptr, handle, j, gymapi.MESH_VISUAL,
+                        self.gym.set_rigid_body_color(env_ptr, color_handle, 0, gymapi.MESH_VISUAL,
                                                     gymapi.Vec3(0., 1., 0.))
                     else:
-                        self.gym.set_rigid_body_color(env_ptr, handle, j, gymapi.MESH_VISUAL,
+                        self.gym.set_rigid_body_color(env_ptr, color_handle, 0, gymapi.MESH_VISUAL,
                                                     gymapi.Vec3(0., 0., 1.))
         self.render(t=t)
 
@@ -2165,7 +2449,6 @@ class InterMimic(Humanoid_SMPLX):
                 self.save_cam_segs(t=t)
                 self.save_2d_keypoints(t=t)
             self.t_before+=1
-        self.gym.simulate(self.sim)
 
         return
     

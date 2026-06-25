@@ -251,8 +251,8 @@ class Humanoid_SMPLX(BaseTask):
         self.dof_limits_lower = []
         self.dof_limits_upper = []
 
-        max_agg_bodies = self.num_humanoid_bodies + 2
-        max_agg_shapes = self.num_humanoid_shapes + 65  
+        max_agg_bodies = self.num_humanoid_bodies + 2 + getattr(self, "_extra_agg_bodies", 0)
+        max_agg_shapes = self.num_humanoid_shapes + 65 + getattr(self, "_extra_agg_shapes", 0)
 
 
         for i in range(self.num_envs):

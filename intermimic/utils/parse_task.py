@@ -28,7 +28,10 @@
 
 from env.tasks.intermimic import InterMimic
 from env.tasks.intermimic_all import InterMimic_All
-from env.tasks.intermimic_g1 import InterMimicG1
+try:
+    from env.tasks.intermimic_g1 import InterMimicG1
+except ModuleNotFoundError:
+    InterMimicG1 = None
 from env.tasks.vec_task_wrappers import VecTaskPythonWrapper, VecTaskDAggerWrapper
 
 from isaacgym import rlgpu
