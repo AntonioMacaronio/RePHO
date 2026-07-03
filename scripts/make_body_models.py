@@ -65,6 +65,10 @@ def main():
     for gender in ["neutral", "male", "female"]:
         model = build_smplh_pkl(gender, smplx_hands)
         out_fn = os.path.join(args.out, f"SMPLH_{gender.upper()}.pkl")
+        # NEUTRAL may ship as a symlink -> MALE (convert_motion_format.sh recreates it); unlink first
+        # so we don't write THROUGH the link and corrupt male / leave neutral==male.
+        if os.path.islink(out_fn) or os.path.exists(out_fn):
+            os.remove(out_fn)
         with open(out_fn, "wb") as f:
             pickle.dump(model, f)
         print(f"wrote {out_fn}  (v_template={model['v_template'].shape}, "

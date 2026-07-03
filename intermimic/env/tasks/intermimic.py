@@ -2279,6 +2279,11 @@ class InterMimic(Humanoid_SMPLX):
         cc_left_error[left_hand_contact_any_ref] = cdist_left_new[left_hand_contact_any_ref].mean(dim=-1)
         cc_right_error[right_hand_contact_any_ref] = cdist_right_new[right_hand_contact_any_ref].mean(dim=-1)
         cc_reward = torch.exp(-w['cc'] * (cc_left_error + cc_right_error)) *3
+        # This term is HAND-ONLY. For non-hand-contact experiments (hand labels 0) it is already
+        # behavior-constant, but its constant VALUE (~1.1 at cc:10, 3.0 at cc:0) still scales the
+        # multiplicative reward. Disable it truly-neutrally (factor 1.0) via cfg use_contact_chamfer.
+        if not self.cfg["env"].get("use_contact_chamfer", True):
+            cc_reward = torch.ones_like(cc_reward)
         return cc_reward
 
     
@@ -2344,10 +2349,23 @@ class InterMimic(Humanoid_SMPLX):
         
         rcg_hand = rcg_left * rcg_right
 
-        other_ids = [i for i in range(len(self.contact_bodies)) if i not in left_contact_hand_ids and i not in right_contact_hand_ids]
+        # Non-hand contact bodies. NOTE: contact_human is the full 52-body vector, so this must
+        # range over all 52 ids (the old `range(len(self.contact_bodies))` used the 31-body
+        # contactBodies count and silently dropped ids 33/34/35 = R_Thorax/R_Shoulder/R_Elbow).
+        # Configurable via `contactRewardBodyIds`; defaults to every non-hand body.
+        cfg_other = self.cfg["env"].get("contactRewardBodyIds", None)
+        if cfg_other is not None:
+            other_ids = list(cfg_other)
+        else:
+            other_ids = [i for i in range(52) if i not in left_contact_hand_ids and i not in right_contact_hand_ids]
         ref_other_contact = ref_human_contact[:, other_ids]
         other_contact = human_contact[:, other_ids]
-        ecg_other = ((torch.abs(other_contact - ref_other_contact) * (ref_other_contact > contact_thres))).mean(dim=-1)
+        # Normalize the error over the ACTIVE positive labels, not the full body width: averaging
+        # over all ~36 bodies dilutes a single missed contact (1/36 -> reward barely moves). Dividing
+        # by the per-frame count of reference-positive bodies makes each required contact matter.
+        other_pos = (ref_other_contact > contact_thres)
+        ecg_other = (torch.abs(other_contact - ref_other_contact) * other_pos).sum(dim=-1) \
+            / other_pos.float().sum(dim=-1).clamp_min(1.0)
         rcg_other = torch.exp(-ecg_other*w['cg_other'])
         
         no_contact = torch.abs(human_contact) < contact_thres
