@@ -21,6 +21,55 @@ Usage:
   python scripts/viser_rollout.py \
     --forward <fwd rollout pt> --backward <bwd rollout pt> \
     --ref <ref intermimic.pt> --obj <box.obj> [--port 8080] [--separate]
+
+--------------------------------------------------------------------------------
+HOW TO PRODUCE THE ROLLOUT .pt THIS VIEWER READS
+--------------------------------------------------------------------------------
+This viewer reads SAVED rollout tensors [T,592]; it does NOT attach to a live
+training loop. To view a policy mid-training, run a separate EVAL pass on a
+checkpoint (on a spare GPU so training is undisturbed), which writes the rollout
+via `--save_states`, then point this viewer at it.
+
+The eval pass = `intermimic/run.py --test --save_states`:
+  * `--test`            -> mode='test' (single-env playback of the policy)
+  * `--save_states`     -> on episode end, writes <output_path>/intermimic.pt
+                           [T,592] (cols match this file's header). Then quit()s.
+  * DO NOT pass `--enable_camera_sensors` / `--save_images` on a headless box --
+    that path uses the IsaacGym Vulkan renderer which segfaults here. `--save_states`
+    is independent of it, so state export works without any server-side rendering.
+  * `--num_envs 1`, `--stateInit Start`, `--init_range_left 0`; the BACKWARD
+    policy additionally needs reverse_time (its train script sets it; do NOT pass
+    `--no_reverse_time` for backward, DO pass it for forward).
+
+Checkpoints live at <out_root>/<seq>_dual/{forward,backward}/smplx/nn/mimic_000<EPOCH>.pth
+with matching ref_hoi/ref_hoi_<EPOCH>.npz + hoi_data/intermimic_<EPOCH>.pt. Example
+(forward policy, epoch 53300, eval on GPU 1 while training runs on GPU 0):
+
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"   # isaacgym needs libpython
+  D=tracking_intermediate_file/<seq>_dual; E=53300
+  OUT=data/demo_data/output/rollout_states/forward/<seq>_live; mkdir -p "$OUT"
+  CUDA_VISIBLE_DEVICES=1 python intermimic/run.py --task InterMimic \
+    --cfg_env intermimic/data/cfg/omomo_train_917.yaml \
+    --cfg_train intermimic/data/cfg/train/rlg/omomo.yaml --headless \
+    --output_path "$OUT" --stateInit Start --init_range_left 0 --no_reverse_time \
+    --device_id 0 --rl_device cuda:0 \
+    --motion_file data/demo_data/output/<seq> --sub_file_name intermimic_vistracker \
+    --checkpoint "$D/forward/smplx/nn/mimic_000$E.pth" \
+    --hoi_refs_path "$D/forward/ref_hoi/ref_hoi_$E.npz" \
+    --hoi_data_path "$D/forward/hoi_data/intermimic_$E.pt" \
+    --test --num_envs 1 --save_states
+  # -> $OUT/intermimic.pt  (the [T,592] this viewer wants; col -1 = validity/survived flag)
+
+Repeat for backward (drop --no_reverse_time; use the backward/ checkpoint+refs),
+then launch this viewer on both. `scripts/infer_forward.sh` is the fuller
+image-rendering variant (needs a working camera renderer + epoch>=54500); prefer
+the --save_states path above for headless.
+
+The `--ref` file is the KINEMATIC target the policy tracks -- it is the SAME
+intermimic.pt produced by step-2 (interact_to_tracking_format.py). Loading it as
+the grey ghost lets you compare the physics rollout against the reference, and it
+should match the CRISP-Obj unified_human_scene_object_viewer.py view of the same
+sequence (both draw the reconstructed human+object).
 """
 import argparse
 import time
