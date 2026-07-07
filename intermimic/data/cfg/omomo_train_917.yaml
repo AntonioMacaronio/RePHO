@@ -27,13 +27,12 @@ env:
   localRootObs: False
   keyBodies: ["L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe", "Torso", "Spine", "Chest", "Neck", "Head", "L_Thorax", "L_Shoulder", "L_Elbow", "L_Wrist", "R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist"]
   contactBodies: ["L_Hip", "L_Knee", "L_Ankle", "L_Toe", "R_Hip", "R_Knee", "R_Ankle", "R_Toe", "Torso", "Spine", "Chest", "Neck", "Head", "L_Thorax", "L_Shoulder", "L_Elbow", "L_Wrist", "L_Index3", "L_Middle3", "L_Pinky3", "L_Ring3","L_Thumb3", "R_Thorax", "R_Shoulder", "R_Elbow", "R_Wrist", "R_Index3", "R_Middle3", "R_Pinky3", "R_Ring3","R_Thumb3"] #["right_foot", "left_foot"]
-  # CRISP->RePHO non-hand contact (v1): reward contact over the non-hand 52-body ids (the InteractVLM
-  # bridge only populates these; hands stay 0). Ids are into the full 52-body contact vector.
-  # 0 Pelvis,1-4 L leg,5-8 R leg,9 Torso,10 Spine,11 Chest,12 Neck,13 Head,14 L_Thorax,15 L_Shoulder,
-  # 16 L_Elbow,33 R_Thorax,34 R_Shoulder,35 R_Elbow.
-  contactRewardBodyIds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 33, 34, 35]
-  # Hand-only chamfer term OFF for non-hand contact (avoids its constant rescaling the reward).
-  use_contact_chamfer: False
+  # CONTACT MODEL = HAND (matches RePHO paper §3: "contact markers only for the hands"). The
+  # CRISP->RePHO bridge populates L_Wrist(17)/R_Wrist(36); rcg_hand consumes them and the chamfer term
+  # pulls the sim hands onto the object surface. We therefore use STOCK RePHO reward settings:
+  #   - contactRewardBodyIds: unset -> rcg_other defaults to all non-hand bodies (stock).
+  #   - use_contact_chamfer: unset -> defaults True (stock; chamfer ON, the hand->object pull).
+  # (The earlier v1 overrides here targeted NON-hand contact, which was the wrong model for RePHO.)
   terminationHeight: 0.15
   enableEarlyTermination: True
   physicalBufferSize: 3
