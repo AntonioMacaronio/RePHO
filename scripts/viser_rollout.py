@@ -5,12 +5,17 @@ Why this exists: this node's IsaacGym camera renderer (libnvf Vulkan plugin) is 
 with the installed NVIDIA 570 driver and segfaults. viser renders client-side in the browser (WebGL),
 bypassing the server graphics stack entirely.
 
-Design (per review feedback):
-  * ALL frames for every track are added to the scene ONCE at startup; animation just toggles
-    per-frame `.visible` — no scene-API calls in the playback loop.
+Design:
+  * Each track uploads a FIXED set of handles ONCE (a joints point-cloud, a bones line-segment set,
+    and — for the object — the mesh geometry a single time). Playback MUTATES those handles per frame
+    (`.points`, `.colors`, `.position`, `.wxyz`) rather than adding a copy per timestep. This keeps
+    the scene at O(#tracks) objects and streams the object mesh across the wire only once, so startup
+    is fast even for long clips (the old "add T copies + toggle .visible" design streamed ~3000+
+    objects for 4 tracks x 265 frames -> slow load).
   * Shows BOTH the forward and backward rollouts, plus the kinematic reference ("ghost") for each.
-    A GUI dropdown selects which tracks are shown; forward/backward can be offset along x so they
-    don't overlap, or overlaid.
+    Checkboxes select which tracks are shown; forward/backward can be offset along x (--separate).
+  * NOTE: a mesh handle's color cannot be reassigned per frame, so the object's per-frame contact
+    color (red on contact) is dropped; object contact is still conveyed by the red hand joints.
 
 Input: rollout `intermimic.pt` saved by `intermimic/run.py --save_states` (shape [T, 592]):
   0:3 root_pos | 3:7 root_rot quat(xyzw) | 162:318 body_pos 52x3 (MuJoCo order, WORLD)
@@ -96,7 +101,14 @@ def quat_xyzw_to_wxyz(q):
 
 
 class Track:
-    """One animated entity (human skeleton + object) built ONCE, animated by visibility toggling."""
+    """One animated entity (human skeleton + object), built ONCE and animated by MUTATING a fixed
+    set of handles per frame (joints .points/.colors, bones .points, object .position/.wxyz).
+
+    The previous design added T copies of every asset (frame + joints + bones + object mesh) and
+    toggled visibility. With 4 tracks x 265 frames that is ~3000+ scene objects streamed to the
+    browser at startup -> long load. Here each track uploads exactly 3 handles (+ the object mesh
+    geometry once) and the playback loop just reassigns their per-frame arrays: O(1) scene objects,
+    the mesh vertices/faces cross the wire a single time."""
 
     def __init__(self, server, name, states, bones, overts, ofaces, x_offset=0.0,
                  body_color=(80, 140, 240), is_ref=False):
@@ -104,58 +116,72 @@ class Track:
         self.name = name
         self.T = states.shape[0]
         self.is_ref = is_ref
-        body_pos = states[:, 162:318].reshape(self.T, 52, 3).copy()
-        body_pos[:, :, 0] += x_offset
-        self.frame_nodes = []  # one parent frame per timestep; toggle .visible
+        self.bones = bones
+        self.x_offset = x_offset
 
-        # Render the object for BOTH physics rollouts and the kinematic reference.
-        # The ref's object (cols 318:325) is the noisy VisTracker input — showing it ghosted lets you
-        # see the floating/penetrating kinematic object vs. the physics-corrected one.
-        has_obj = overts is not None
-        if has_obj:
-            obj_pos = states[:, 318:321].copy(); obj_pos[:, 0] += x_offset
-            obj_rot = states[:, 321:325]
-        contact_obj = states[:, 330] if not is_ref else None
-        contact_h = states[:, 331:383] if not is_ref else None
+        # ---- precompute per-frame arrays (cheap, no scene traffic) ----
+        self.body_pos = states[:, 162:318].reshape(self.T, 52, 3).astype(np.float32).copy()
+        self.body_pos[:, :, 0] += x_offset                          # (T,52,3) joint positions
+        self.bone_seg = np.stack([self.body_pos[:, bones[:, 0]],
+                                  self.body_pos[:, bones[:, 1]]], axis=2)  # (T,nb,2,3)
 
-        for f in range(self.T):
-            parent = f"/{name}/f{f:04d}"
-            node = server.scene.add_frame(parent, show_axes=False, visible=(f == 0))
-            self.frame_nodes.append(node)
-            jp = body_pos[f]
-            # joint colors: hands red on contact (skip for ref ghost)
-            cols = np.tile(np.array(body_color, np.uint8), (52, 1))
-            if not is_ref:
-                for h in HAND_MUJ:
-                    if contact_h[f, h] > 0.5:
-                        cols[h] = (240, 60, 60)
-            server.scene.add_point_cloud(f"{parent}/joints", points=jp, colors=cols,
-                                         point_size=0.02 if is_ref else 0.028, point_shape="circle")
-            seg = np.stack([jp[bones[:, 0]], jp[bones[:, 1]]], axis=1)
-            bone_col = (150, 150, 150) if is_ref else (230, 230, 240)
-            server.scene.add_line_segments(f"{parent}/bones", points=seg, colors=bone_col,
-                                           line_width=2.0 if is_ref else 3.0)
-            if has_obj:
-                if is_ref:
-                    # ghosted kinematic-input object: grey wireframe, translucent
-                    server.scene.add_mesh_simple(f"{parent}/object", vertices=overts, faces=ofaces,
-                                                 color=(150, 150, 150), wireframe=True,
-                                                 wxyz=quat_xyzw_to_wxyz(obj_rot[f]),
-                                                 position=obj_pos[f].astype(np.float32), opacity=0.35)
-                else:
-                    ocol = (220, 70, 70) if contact_obj[f] > 0.5 else (210, 180, 70)
-                    server.scene.add_mesh_simple(f"{parent}/object", vertices=overts, faces=ofaces,
-                                                 color=ocol, wxyz=quat_xyzw_to_wxyz(obj_rot[f]),
-                                                 position=obj_pos[f].astype(np.float32), opacity=0.85)
+        self.has_obj = overts is not None
+        if self.has_obj:
+            self.obj_pos = states[:, 318:321].astype(np.float32).copy(); self.obj_pos[:, 0] += x_offset
+            self.obj_rot = states[:, 321:325].astype(np.float32)     # xyzw quats
+
+        # per-frame joint colors (hands turn red on contact; ref is a static grey ghost)
+        base = np.tile(np.array(body_color, np.uint8), (self.T, 52, 1))
+        if not is_ref:
+            contact_h = states[:, 331:383]                           # (T,52) per-body contact
+            hot = contact_h[:, HAND_MUJ] > 0.5                       # (T, |hands|)
+            for k, h in enumerate(HAND_MUJ):
+                base[hot[:, k], h] = (240, 60, 60)
+            self.contact_obj = states[:, 330]                        # object-in-contact per frame
+        self.joint_cols = base                                       # (T,52,3)
+        self.bone_col = (150, 150, 150) if is_ref else (230, 230, 240)
+
+        # ---- create the FIXED handles once (frame 0) ----
+        parent = f"/{name}"
+        server.scene.add_frame(parent, show_axes=False)
+        self.joints_h = server.scene.add_point_cloud(
+            f"{parent}/joints", points=self.body_pos[0], colors=self.joint_cols[0],
+            point_size=0.02 if is_ref else 0.028, point_shape="circle")
+        self.bones_h = server.scene.add_line_segments(
+            f"{parent}/bones", points=self.bone_seg[0], colors=self.bone_col,
+            line_width=2.0 if is_ref else 3.0)
+        self.obj_h = None
+        if self.has_obj:
+            if is_ref:
+                self.obj_h = server.scene.add_mesh_simple(
+                    f"{parent}/object", vertices=overts, faces=ofaces, color=(150, 150, 150),
+                    wireframe=True, opacity=0.35,
+                    wxyz=quat_xyzw_to_wxyz(self.obj_rot[0]), position=self.obj_pos[0])
+            else:
+                # object mesh geometry uploaded ONCE; color can't be mutated per-frame on a mesh
+                # handle, so pick a single manipulation color (contact state still shown via the
+                # red hand joints + the object-contact GUI is dropped in favor of the joint cue).
+                self.obj_h = server.scene.add_mesh_simple(
+                    f"{parent}/object", vertices=overts, faces=ofaces, color=(210, 180, 70),
+                    opacity=0.85, wxyz=quat_xyzw_to_wxyz(self.obj_rot[0]), position=self.obj_pos[0])
 
     def set_frame(self, f):
-        f = min(f, self.T - 1)
-        for i, node in enumerate(self.frame_nodes):
-            node.visible = (i == f)
+        f = min(int(f), self.T - 1)
+        self.joints_h.points = self.body_pos[f]
+        self.joints_h.colors = self.joint_cols[f]
+        self.bones_h.points = self.bone_seg[f]
+        if self.obj_h is not None:
+            self.obj_h.position = self.obj_pos[f]
+            self.obj_h.wxyz = quat_xyzw_to_wxyz(self.obj_rot[f])
+
+    def set_visible(self, v: bool):
+        self.joints_h.visible = v
+        self.bones_h.visible = v
+        if self.obj_h is not None:
+            self.obj_h.visible = v
 
     def hide(self):
-        for node in self.frame_nodes:
-            node.visible = False
+        self.set_visible(False)
 
 
 def main():
@@ -210,24 +236,33 @@ def main():
     gui_play = server.gui.add_checkbox("play", True)
     gui_fps = server.gui.add_slider("fps", 1, 60, 1, int(args.fps))
 
-    def apply(fi):
+    def _vis_map():
+        return {"forward": show_fwd.value, "backward": show_bwd.value,
+                "ref_fwd": show_ref.value, "ref_bwd": show_ref.value}
+
+    def set_frame(fi):
+        """Advance every VISIBLE track to frame fi (mutates handles in place; no scene rebuild)."""
         fi = int(fi)
-        on = {"forward": show_fwd.value, "backward": show_bwd.value,
-              "ref_fwd": show_ref.value, "ref_bwd": show_ref.value}
+        on = _vis_map()
         for key, tr in tracks.items():
             if on.get(key, False):
                 tr.set_frame(fi)
-            else:
-                tr.hide()
+
+    def apply_visibility():
+        """Toggle track visibility only (checkbox change) — cheap, no per-frame array push."""
+        on = _vis_map()
+        for key, tr in tracks.items():
+            tr.set_visible(on.get(key, False))
+        set_frame(gui_frame.value)   # refresh newly-shown tracks to the current frame
 
     @gui_frame.on_update
     def _(_):
-        apply(gui_frame.value)
+        set_frame(gui_frame.value)
 
     for cb in (show_fwd, show_bwd, show_ref):
-        cb.on_update(lambda _: apply(gui_frame.value))
+        cb.on_update(lambda _: apply_visibility())
 
-    apply(0)
+    apply_visibility()
     print(f"[viser] open http://localhost:{args.port}  (forward the port)")
     while True:
         if gui_play.value:
