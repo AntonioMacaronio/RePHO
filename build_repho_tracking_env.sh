@@ -5,7 +5,8 @@ set -o pipefail
 
 CONDA=/home/sky/miniconda3
 ENV_NAME=RePHO_tracking
-REPO=/home/sky/sky_workdir/RePHO
+# Derive REPO from this script's own location so it works regardless of checkout path.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export PATH="$CONDA/bin:$PATH"
 # CUDA_HOME for any source builds (pytorch3d/isaacgym extensions)
